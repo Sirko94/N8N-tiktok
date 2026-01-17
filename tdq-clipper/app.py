@@ -45,11 +45,6 @@ def is_429(stderr: str) -> bool:
         return False
     s = stderr.lower()
     return ("http error 429" in s) or ("too many requests" in s) or (" 429" in s)
-
-def acquire_lock(name: str, timeout_sec: int = 180):
-    lock_path = os.path.join(LOCK_DIR, f"{name}.lock")
-    start = time.time()
-    while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(fd, str(os.getpid()).encode("utf-8"))
@@ -57,7 +52,6 @@ def acquire_lock(name: str, timeout_sec: int = 180):
             return lock_path
         except FileExistsError:
             if time.time() - start > timeout_sec:
-                raise RuntimeError(f"lock timeout for {name}")
             time.sleep(0.4)
 
 def release_lock(lock_path: str):
