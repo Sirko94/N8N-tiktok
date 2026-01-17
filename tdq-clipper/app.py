@@ -113,6 +113,7 @@ def yt_dlp_subs(video_id: str, lang: str, tries: int = 4):
         "--sub-format", "vtt",
         "--sub-langs", lang,
         "--output", out_tpl,
+        "--js-runtimes", "node",
         url
     ]
 
@@ -160,6 +161,7 @@ def ensure_raw_mp4(video_id: str):
             "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
             "--merge-output-format", "mp4",
             "-o", out_tpl,
+            "--js-runtimes", "node",
             url
         ]
         code, outlog, err = run(cmd)
