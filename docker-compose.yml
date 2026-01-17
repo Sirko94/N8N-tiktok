@@ -1,0 +1,297 @@
+version: "3.8"
+
+services:
+  n8n:
+    image: n8nio/n8n:2.3.5
+    container_name: n8n
+    restart: always
+    environment:
+      - N8N_HOST=n8n.exonas.net
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - NODE_ENV=production
+      - WEBHOOK_URL=https://n8n.exonas.net/
+      - GENERIC_TIMEZONE=Europe/Paris
+      - N8N_FILES_ALLOWED_PATHS=/home/node/.n8n-files
+      - N8N_BINARY_DATA_MODE=filesystem
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - n8n_files:/home/node/.n8n-files
+    networks:
+      - motorway2
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.n8n.rule=Host(`n8n.exonas.net`)"
+      - "traefik.http.routers.n8n.entrypoints=websecure"
+      - "traefik.http.routers.n8n.tls=true"
+      - "traefik.http.routers.n8n.tls.certresolver=letsEncrypt"
+      - "traefik.http.services.n8n.loadbalancer.server.port=5678"
+
+  tdq-clipper:
+    image: python:3.12-slim
+    container_name: tdq-clipper
+    restart: always
+    networks:
+      - motorway2
+    volumes:
+      - tdq_files:/data
+      - n8n_files:/n8n-files
+    expose:
+      - "8580"
+    command:
+      - /bin/sh
+      - -lc
+      - |
+          set -e
+          apt-get update
+          # Install ffmpeg and libass for subtitle rendering, plus a basic font
+          apt-get install -y --no-install-recommends \
+            ffmpeg ca-certificates curl nodejs \
+            libass9 fonts-dejavu-core
+          pip install --no-cache-dir -U yt-dlp flask
+
+          cat > /app.py << 'PY'
+          from flask import Flask, request, jsonify
+          import subprocess, os, uuid, glob, shutil, time
+
+          app = Flask(__name__)
+
+          RAW_DIR = "/data/raw"
+          SUB_DIR = "/data/subs"
+          FINAL_DIR = "/data/final"
+          N8N_FINAL_DIR = "/n8n-files/final"
+          LOCK_DIR = "/data/locks"
+
+          os.makedirs(RAW_DIR, exist_ok=True)
+          os.makedirs(SUB_DIR, exist_ok=True)
+          os.makedirs(FINAL_DIR, exist_ok=True)
+          os.makedirs(N8N_FINAL_DIR, exist_ok=True)
+          os.makedirs(LOCK_DIR, exist_ok=True)
+
+          def run(cmd):
+              p = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+              return p.returncode, p.stdout, p.stderr
+
+          def is_429(stderr: str) -> bool:
+              if not stderr:
+                  return False
+              s = stderr.lower()
+              return ("http error 429" in s) or ("too many requests" in s) or (" 429" in s)
+
+          def acquire_lock(name: str, timeout_sec: int = 180):
+              lock_path = os.path.join(LOCK_DIR, f"{name}.lock")
+              start = time.time()
+              while True:
+                  try:
+                      fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                      os.write(fd, str(os.getpid()).encode("utf-8"))
+                      os.close(fd)
+                      return lock_path
+                  except FileExistsError:
+                      if time.time() - start > timeout_sec:
+                          raise RuntimeError(f"lock timeout for {name}")
+                      time.sleep(0.4)
+
+          def release_lock(lock_path: str):
+              try:
+                  os.remove(lock_path)
+              except:
+                  pass
+
+          def yt_dlp_subs(video_id: str, lang: str, tries: int = 4):
+              url = f"https://www.youtube.com/watch?v={video_id}"
+              out_tpl = f"{SUB_DIR}/{video_id}.%(ext)s"
+
+              for f in glob.glob(f"{SUB_DIR}/{video_id}*.{lang}.vtt"):
+                  try: os.remove(f)
+                  except: pass
+
+              cmd = [
+                  "yt-dlp",
+                  "--skip-download",
+                  "--write-subs",
+                  "--write-auto-subs",
+                  "--sub-format", "vtt",
+                  "--sub-langs", lang,
+                  "--output", out_tpl,
+                  "--js-runtimes", "node",
+                  url
+              ]
+
+              backoff = [5, 15, 45, 90]
+              last_out = ""
+              last_err = ""
+
+              for attempt in range(tries):
+                  code, outlog, err = run(cmd)
+                  last_out, last_err = outlog, err
+
+                  if code == 0:
+                      matches = sorted(glob.glob(f"{SUB_DIR}/{video_id}*.{lang}.vtt"))
+                      if matches:
+                          return True, outlog, err, matches[0]
+                      return False, outlog, err, None
+
+                  if is_429(err) and attempt < tries - 1:
+                      time.sleep(backoff[min(attempt, len(backoff)-1)])
+                      continue
+
+                  return False, outlog, err, None
+
+              return False, last_out, last_err, None
+
+          def ensure_raw_mp4(video_id: str):
+              raw_mp4 = os.path.join(RAW_DIR, f"{video_id}.mp4")
+              if os.path.exists(raw_mp4) and os.path.getsize(raw_mp4) > 1024 * 1024:
+                  return raw_mp4, None, None
+
+              lock = acquire_lock(f"dl-{video_id}")
+              try:
+                  if os.path.exists(raw_mp4) and os.path.getsize(raw_mp4) > 1024 * 1024:
+                      return raw_mp4, None, None
+
+                  url = f"https://www.youtube.com/watch?v={video_id}"
+                  out_tpl = os.path.join(RAW_DIR, f"{video_id}.%(ext)s")
+
+                  cmd = [
+                      "yt-dlp",
+                      "--force-overwrites",
+                      "--no-part",
+                      "--retries", "10",
+                      "--fragment-retries", "10",
+                      "--concurrent-fragments", "1",
+                      "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+                      "--merge-output-format", "mp4",
+                      "-o", out_tpl,
+                      "--js-runtimes", "node",
+                      url
+                  ]
+                  code, outlog, err = run(cmd)
+                  if code != 0:
+                      return None, outlog, err
+
+                  candidates = sorted(glob.glob(os.path.join(RAW_DIR, f"{video_id}*.mp4")))
+                  if not candidates:
+                      return None, outlog, err
+
+                  candidates.sort(key=lambda p: os.path.getsize(p))
+                  src = candidates[-1]
+
+                  if src != raw_mp4:
+                      try:
+                          shutil.move(src, raw_mp4)
+                      except:
+                          shutil.copyfile(src, raw_mp4)
+
+                  if not os.path.exists(raw_mp4) or os.path.getsize(raw_mp4) < 1024 * 1024:
+                      return None, outlog, err
+
+                  return raw_mp4, outlog, err
+              finally:
+                  release_lock(lock)
+
+          @app.post("/transcript")
+          def transcript():
+              data = request.get_json(force=True)
+              video_id = data["videoId"]
+
+              ok_fr, out_fr, err_fr, vtt_fr = yt_dlp_subs(video_id, "fr", tries=4)
+              if ok_fr and vtt_fr:
+                  with open(vtt_fr, "r", encoding="utf-8", errors="ignore") as f:
+                      vtt = f.read()
+                  return jsonify({"ok": True, "videoId": video_id, "lang": "fr",
+                                  "vttPath": vtt_fr, "vtt": vtt})
+
+              ok_en, out_en, err_en, vtt_en = yt_dlp_subs(video_id, "en", tries=4)
+              if ok_en and vtt_en:
+                  with open(vtt_en, "r", encoding="utf-8", errors="ignore") as f:
+                      vtt = f.read()
+                  return jsonify({"ok": True, "videoId": video_id, "lang": "en",
+                                  "vttPath": vtt_en, "vtt": vtt})
+
+              return jsonify({
+                  "ok": False,
+                  "step": "yt-dlp-subs",
+                  "error": "no vtt generated (rate-limit / subtitles disabled / blocked)",
+                  "stdout_fr": out_fr, "stderr_fr": err_fr,
+                  "stdout_en": out_en, "stderr_en": err_en
+              }), 500
+
+          @app.post("/clip")
+          def clip():
+              data = request.get_json(force=True)
+              video_id = data["videoId"]
+              start = data.get("start", "00:01:00.000")
+              dur = float(data.get("duration", 120))
+              vtt_path = data.get("vttPath")
+              burn = bool(data.get("burnSubtitles", True))
+
+              raw, yout, yerr = ensure_raw_mp4(video_id)
+              if not raw:
+                  return jsonify({"ok": False, "step": "yt-dlp",
+                                  "error": "download did not create raw mp4",
+                                  "stdout": yout or "", "stderr": yerr or ""}), 500
+
+              out_name = f"{video_id}_{uuid.uuid4().hex}_9x16.mp4"
+              out = f"{FINAL_DIR}/{out_name}"
+              n8n_out = f"{N8N_FINAL_DIR}/{out_name}"
+
+              vf = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+
+              # Subtitles styling: purple background, mid‑small font, karaoke effect (ASS tags)
+              if burn and vtt_path and os.path.exists(vtt_path):
+                  safe_vtt = vtt_path.replace("\\", "\\\\").replace("'", "\\'")
+                  # Example style: violet background, white text with bold, semi‑opaque box
+                  style = ("FontName=DejaVu Sans,FontSize=32,"
+                           "PrimaryColour=&H00FFFFFF&,BackColour=&H64006A0D&,"
+                           "BorderStyle=3,Outline=1,Shadow=0,Alignment=2,"
+                           "MarginV=20")
+                  vf = vf + f",subtitles='{safe_vtt}':force_style='{style}'"
+
+              cmd = [
+                  "ffmpeg", "-y",
+                  "-ss", str(start),
+                  "-i", raw,
+                  "-t", str(dur),
+                  "-vf", vf,
+                  "-map", "0:v:0?",
+                  "-map", "0:a:0?",
+                  "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                  "-c:a", "aac", "-b:a", "128k",
+                  "-movflags", "+faststart",
+                  out
+              ]
+              code, ffout, fferr = run(cmd)
+              if code != 0:
+                  return jsonify({"ok": False, "step": "ffmpeg", "stdout": ffout, "stderr": fferr, "vf": vf}), 500
+
+              try:
+                  shutil.copyfile(out, n8n_out)
+              except Exception as e:
+                  return jsonify({"ok": False, "step": "copy-to-n8n",
+                                  "error": str(e), "src": out, "dst": n8n_out}), 500
+
+              return jsonify({
+                  "ok": True,
+                  "videoId": video_id,
+                  "raw": raw,
+                  "path": out,
+                  "n8nPath": f"/home/node/.n8n-files/final/{out_name}",
+                  "subsBurned": bool(burn and vtt_path and os.path.exists(vtt_path)),
+                  "vttPath": vtt_path if vtt_path else None
+              })
+
+          if __name__ == "__main__":
+              app.run(host="0.0.0.0", port=8580)
+          PY
+
+          python /app.py
+volumes:
+  n8n_data:
+  tdq_files:
+  n8n_files:
+
+networks:
+  motorway2:
+    external: true
