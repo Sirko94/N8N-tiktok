@@ -38,6 +38,8 @@ services:
     volumes:
       - tdq_files:/data
       - n8n_files:/n8n-files
+      # Optionnel si un jour tu veux des cookies youtube:
+      # - ./cookies.txt:/data/cookies.txt:ro
     expose:
       - "8580"
 
