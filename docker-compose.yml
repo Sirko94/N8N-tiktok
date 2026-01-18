@@ -31,7 +31,6 @@ services:
     build:
       context: ./tdq-clipper
     image: tdq-clipper:latest
-    image: sirko94/tdq-clipper:latest
     container_name: tdq-clipper
     restart: always
     networks:
