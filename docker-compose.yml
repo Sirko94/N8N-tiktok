@@ -6,14 +6,14 @@ services:
     container_name: n8n
     restart: always
     environment:
-      N8N_HOST: n8n.exonas.net
-      N8N_PORT: 5678
-      N8N_PROTOCOL: https
-      NODE_ENV: production
-      WEBHOOK_URL: https://n8n.exonas.net/
-      GENERIC_TIMEZONE: Europe/Paris
-      N8N_FILES_ALLOWED_PATHS: /home/node/.n8n-files
-      N8N_BINARY_DATA_MODE: filesystem
+      - N8N_HOST=n8n.exonas.net
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=https
+      - NODE_ENV=production
+      - WEBHOOK_URL=https://n8n.exonas.net/
+      - GENERIC_TIMEZONE=Europe/Paris
+      - N8N_FILES_ALLOWED_PATHS=/home/node/.n8n-files
+      - N8N_BINARY_DATA_MODE=filesystem
     volumes:
       - n8n_data:/home/node/.n8n
       - n8n_files:/home/node/.n8n-files
@@ -30,7 +30,8 @@ services:
   tdq-clipper:
     build:
       context: ./tdq-clipper
-    image: tdq-clipper:latest
+      dockerfile: Dockerfile
+    image: sirko94/tdq-clipper:latest
     container_name: tdq-clipper
     restart: always
     networks:
@@ -38,6 +39,8 @@ services:
     volumes:
       - tdq_files:/data
       - n8n_files:/n8n-files
+      # Optionnel si un jour tu veux des cookies youtube:
+      # - ./cookies.txt:/data/cookies.txt:ro
     expose:
       - "8580"
 
