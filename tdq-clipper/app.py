@@ -9,6 +9,7 @@ SUB_DIR = "/data/subs"
 FINAL_DIR = "/data/final"
 N8N_FINAL_DIR = "/n8n-files/final"
 LOCK_DIR = "/data/locks"
+COOKIES = "/data/cookies.txt"
 COOKIES = "/data/cookies.txt"  # optionnel
 
 os.makedirs(RAW_DIR, exist_ok=True)
@@ -96,6 +97,22 @@ def release_lock(lock_path: str):
         pass
     except Exception:
         pass
+
+def yt_dlp_common_args():
+    args = [
+        "--retries", "10",
+        "--fragment-retries", "10",
+        "--concurrent-fragments", "1",
+        "--sleep-interval", "1",
+        "--max-sleep-interval", "3",
+        "--user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "--extractor-args", "youtube:player_client=android",
+        "--js-runtimes", "node:/usr/bin/node",
+    ]
+    if os.path.exists(COOKIES):
+        args += ["--cookies", COOKIES]
+    return args
 
 def hmsms_to_ms(h, m, s, ms):
     return (((int(h) * 60 + int(m)) * 60) + int(s)) * 1000 + int(ms)
